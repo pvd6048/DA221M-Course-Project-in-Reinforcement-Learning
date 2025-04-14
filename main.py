@@ -11,6 +11,12 @@ from sac import SAC  # Assuming sac.py is in the same directory and compatible
 from torch.utils.tensorboard import SummaryWriter
 from replay_memory import ReplayMemory # Assuming replay_memory.py is compatible
 
+# --- Add Imports for Logging, Saving, and Plotting ---
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+# ---
+
 parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
 # Updated default environment name to a v4 version
 parser.add_argument('--env-name', default="Humanoid-v4", # Example v4 environment
@@ -48,7 +54,19 @@ parser.add_argument('--replay_size', type=int, default=1000000, metavar='N',
                     help='size of replay buffer (default: 10000000)')
 parser.add_argument('--cuda', action="store_true",
                     help='run on CUDA (default: False)')
+# --- Add argument for output directory ---
+parser.add_argument('--output_dir', default='results',
+                    help='Directory to save results and plots (default: results)')
+
 args = parser.parse_args()
+
+# --- Create Output Directory ---
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+run_name = f"sac_{args.env_name}_seed{args.seed}_{timestamp}"
+output_path = os.path.join(args.output_dir, run_name)
+os.makedirs(output_path, exist_ok=True)
+print(f"Saving results to: {output_path}")
+# ---
 
 # Environment
 # Ensure any wrappers used (like NormalizedActions if uncommented) are compatible with Gymnasium API
@@ -69,18 +87,25 @@ np.random.seed(args.seed)
 # Ensure SAC class is compatible with Gymnasium's observation/action spaces if using Gymnasium
 agent = SAC(env.observation_space.shape[0], env.action_space, args)
 
-# Tensorboard (corrected typo)
-writer = SummaryWriter('runs/{}_SAC_{}_{}_{}'.format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), args.env_name,
-                                                             args.policy, "autotune" if args.automatic_entropy_tuning else ""))
+# Tensorboard (corrected typo) - Save TensorBoard logs within the run directory
+writer = SummaryWriter(log_dir=os.path.join(output_path, 'tensorboard'))
 
 # Memory
 # Ensure ReplayMemory is compatible with data types and structure
 memory = ReplayMemory(args.replay_size, args.seed)
 
+# --- Initialize Lists to Store Log Data ---
+train_rewards_log = []
+train_steps_log = []
+test_rewards_log = []
+test_steps_log = []
+# ---
+
 # Training Loop
 total_numsteps = 0
 updates = 0
 
+print("Starting training...")
 for i_episode in itertools.count(1):
     episode_reward = 0
     episode_steps = 0
@@ -90,11 +115,7 @@ for i_episode in itertools.count(1):
     # state = env.reset() # Old reset call
     # New reset call: pass seed, receive tuple (observation, info)
     # Seeding only the first episode's reset ensures run reproducibility.
-    # Seeding every reset makes each episode start identically if run standalone.
-    # Choose based on desired reproducibility level. Here, seeding first reset:
     state, info = env.reset(seed=args.seed if i_episode == 1 else None)
-    # Alternatively, seed every reset:
-    # state, info = env.reset(seed=args.seed)
 
     # Use terminated/truncated flags from Gymnasium API
     terminated = False
@@ -114,6 +135,7 @@ for i_episode in itertools.count(1):
                 # Ensure agent.update_parameters is compatible
                 critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(memory, args.batch_size, updates)
 
+                # Log losses to TensorBoard
                 writer.add_scalar('loss/critic_1', critic_1_loss, updates)
                 writer.add_scalar('loss/critic_2', critic_2_loss, updates)
                 writer.add_scalar('loss/policy', policy_loss, updates)
@@ -123,8 +145,6 @@ for i_episode in itertools.count(1):
                 updates += 1
 
         # --- CHANGE 2.2: Modify env.step() call ---
-        # next_state, reward, done, _ = env.step(action) # Old step call (4 return values)
-        # New step call (5 return values)
         next_state, reward, terminated, truncated, info = env.step(action)
 
         episode_steps += 1
@@ -132,9 +152,6 @@ for i_episode in itertools.count(1):
         episode_reward += reward
 
         # --- CHANGE 3: Update mask calculation based on 'terminated' flag ---
-        # Old mask logic might rely on internal _max_episode_steps or combined 'done'
-        # mask = 1 if episode_steps == env._max_episode_steps else float(not done)
-        # New mask logic: mask is 0 if terminated (final state), 1 otherwise (including truncation)
         mask = float(not terminated)
 
         # Ensure memory.push expects the correct data types and order
@@ -143,28 +160,31 @@ for i_episode in itertools.count(1):
         state = next_state
         # The loop condition `while not (terminated or truncated):` handles exiting the loop
 
-    if total_numsteps > args.num_steps:
-        break
+    # --- Log Training Episode Results ---
+    train_rewards_log.append(episode_reward)
+    train_steps_log.append(total_numsteps)
+    writer.add_scalar('reward/train', episode_reward, i_episode) # Log to TensorBoard as well
+    # Reduce console output frequency (optional)
+    if i_episode % 100 == 0: # Print every 100 episodes
+         print(f"Episode: {i_episode}, Total Numsteps: {total_numsteps}, Episode Steps: {episode_steps}, Training Reward: {episode_reward:.2f}")
+    # ---
 
-    writer.add_scalar('reward/train', episode_reward, i_episode)
-    print("Episode: {}, total numsteps: {}, episode steps: {}, reward: {}".format(i_episode, total_numsteps, episode_steps, round(episode_reward, 2)))
+    # Check termination condition
+    if total_numsteps > args.num_steps:
+        print(f"Reached maximum number of steps: {args.num_steps}. Stopping training.")
+        break
 
     # Evaluation loop
     if i_episode % 10 == 0 and args.eval is True:
         avg_reward = 0.
-        episodes = 10
-        for eval_ep in range(episodes): # Use a different loop variable name
+        eval_episodes = 10 # Use a distinct variable name
+        for eval_ep in range(eval_episodes):
             # --- CHANGE 4.1: Modify env.reset() call in eval loop ---
-            # state = env.reset() # Old reset call
-            # New reset call for evaluation: Seed for consistency, get tuple
-            # Seed each evaluation episode reset for consistent eval comparison
-            state, info = env.reset(seed=args.seed + eval_ep) # Use different seeds for each eval ep
-            # state, info = env.reset(seed=args.seed) # Or use the same seed for all eval eps
+            state, info = env.reset(seed=args.seed + eval_ep) # Seed each eval episode differently
 
-            # Reset flags for evaluation episode
             eval_terminated = False
             eval_truncated = False
-            episode_reward = 0 # Renamed from eval_episode_reward for clarity
+            eval_episode_reward = 0 # Use a distinct variable name
 
             # Evaluation loop condition
             while not (eval_terminated or eval_truncated):
@@ -172,21 +192,85 @@ for i_episode in itertools.count(1):
                 action = agent.select_action(state, evaluate=True)
 
                 # --- CHANGE 4.2: Modify env.step() call in eval loop ---
-                # next_state, reward, done, _ = env.step(action) # Old step call
-                # New step call
                 next_state, reward, eval_terminated, eval_truncated, info = env.step(action)
 
-                episode_reward += reward
+                eval_episode_reward += reward
                 state = next_state
-                # Loop condition handles exit
 
-            avg_reward += episode_reward
-        avg_reward /= episodes # Calculate average over evaluation episodes
+            avg_reward += eval_episode_reward
+        avg_reward /= eval_episodes # Calculate average over evaluation episodes
 
-        writer.add_scalar('avg_reward/test', avg_reward, i_episode)
-
+        # --- Log Test Results ---
+        test_rewards_log.append(avg_reward)
+        test_steps_log.append(total_numsteps)
+        writer.add_scalar('avg_reward/test', avg_reward, i_episode) # Log to TensorBoard
         print("----------------------------------------")
-        print("Test Episodes: {}, Avg. Reward: {}".format(episodes, round(avg_reward, 2)))
+        print(f"Test Episodes: {eval_episodes}, Avg. Reward: {avg_reward:.2f} at Step: {total_numsteps}")
         print("----------------------------------------")
+        # ---
 
 env.close()
+writer.close() # Close the TensorBoard writer
+print("Training finished.")
+
+# --- Saving Test Results to CSV ---
+print("Saving test results...")
+results_df = pd.DataFrame({
+    'timesteps': test_steps_log,
+    'average_reward': test_rewards_log
+})
+csv_filename = os.path.join(output_path, "test_results.csv")
+results_df.to_csv(csv_filename, index=False)
+print(f"Saved test results to {csv_filename}")
+
+# --- Optionally save full training log ---
+# print("Saving training log...")
+# train_df = pd.DataFrame({
+#     'timesteps': train_steps_log,
+#     'episode_reward': train_rewards_log
+# })
+# train_csv_filename = os.path.join(output_path, "train_log.csv")
+# train_df.to_csv(train_csv_filename, index=False)
+# print(f"Saved training log to {train_csv_filename}")
+# ---
+
+# --- Plotting Results ---
+print("Generating plots...")
+plt.style.use('seaborn-v0_8-darkgrid') # Use a nice style
+
+fig, ax = plt.subplots(1, 2, figsize=(16, 6)) # Create 2 subplots
+
+# Plot Training Rewards (Optional: Plot rolling average for smoother curve)
+# Calculate rolling average
+train_rewards_series = pd.Series(train_rewards_log)
+rolling_window = 50 # Adjust window size as needed
+train_rewards_rolling = train_rewards_series.rolling(window=rolling_window, min_periods=1).mean()
+
+# ax[0].plot(train_steps_log, train_rewards_log, alpha=0.3, label='Episode Reward') # Raw data
+ax[0].plot(train_steps_log, train_rewards_rolling, label=f'Training Reward (Rolling Avg {rolling_window})')
+ax[0].set_xlabel("Total Timesteps")
+ax[0].set_ylabel("Reward")
+ax[0].set_title("Training Episode Rewards")
+ax[0].legend()
+ax[0].ticklabel_format(style='sci', axis='x', scilimits=(0,0)) # Use scientific notation for x-axis if numbers are large
+
+# Plot Test Rewards
+ax[1].plot(test_steps_log, test_rewards_log, marker='o', linestyle='-', label='Avg Test Reward')
+ax[1].set_xlabel("Total Timesteps")
+ax[1].set_ylabel("Average Reward")
+ax[1].set_title(f"Average Test Reward ({eval_episodes} Episodes)")
+ax[1].legend()
+ax[1].ticklabel_format(style='sci', axis='x', scilimits=(0,0)) # Use scientific notation for x-axis
+
+plt.suptitle(f'SAC Training Progress - {args.env_name} (Seed: {args.seed})', fontsize=16)
+plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
+
+# Save the plot
+plot_filename = os.path.join(output_path, "training_plot.png")
+plt.savefig(plot_filename)
+print(f"Saved plot to {plot_filename}")
+
+# Display the plot (optional, comment out if running in non-interactive environment)
+# plt.show()
+
+print("Script finished.")
