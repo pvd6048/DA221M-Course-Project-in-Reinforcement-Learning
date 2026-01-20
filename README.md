@@ -15,7 +15,7 @@ Use the below command to install all the required libraries and packages to run 
 python install -r requirements.txt
 ```
 
-### Running the Code
+### Running Code
 For the purpose of ablation studies we had run the scripts in the Humanoid-v4 environment using the alphas- 0.05, 0.04 and 0.02, apart from this, automatic entropy tuning was also done.
 
 #### SAC with different valeus of alpha
